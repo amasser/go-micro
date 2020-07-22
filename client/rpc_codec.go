@@ -4,16 +4,16 @@ import (
 	"bytes"
 	errs "errors"
 
-	"github.com/micro/go-micro/codec"
-	raw "github.com/micro/go-micro/codec/bytes"
-	"github.com/micro/go-micro/codec/grpc"
-	"github.com/micro/go-micro/codec/json"
-	"github.com/micro/go-micro/codec/jsonrpc"
-	"github.com/micro/go-micro/codec/proto"
-	"github.com/micro/go-micro/codec/protorpc"
-	"github.com/micro/go-micro/errors"
-	"github.com/micro/go-micro/registry"
-	"github.com/micro/go-micro/transport"
+	"github.com/micro/go-micro/v2/codec"
+	raw "github.com/micro/go-micro/v2/codec/bytes"
+	"github.com/micro/go-micro/v2/codec/grpc"
+	"github.com/micro/go-micro/v2/codec/json"
+	"github.com/micro/go-micro/v2/codec/jsonrpc"
+	"github.com/micro/go-micro/v2/codec/proto"
+	"github.com/micro/go-micro/v2/codec/protorpc"
+	"github.com/micro/go-micro/v2/errors"
+	"github.com/micro/go-micro/v2/registry"
+	"github.com/micro/go-micro/v2/transport"
 )
 
 const (
@@ -129,10 +129,8 @@ func setHeaders(m *codec.Message, stream string) {
 
 // setupProtocol sets up the old protocol
 func setupProtocol(msg *transport.Message, node *registry.Node) codec.NewCodec {
-	protocol := node.Metadata["protocol"]
-
-	// got protocol
-	if len(protocol) > 0 {
+	// get the protocol from node metadata
+	if protocol := node.Metadata["protocol"]; len(protocol) > 0 {
 		return nil
 	}
 
@@ -186,21 +184,17 @@ func (c *rpcCodec) Write(m *codec.Message, body interface{}) error {
 
 	// if body is bytes Frame don't encode
 	if body != nil {
-		b, ok := body.(*raw.Frame)
-		if ok {
+		if b, ok := body.(*raw.Frame); ok {
 			// set body
 			m.Body = b.Data
-			body = nil
+		} else {
+			// write to codec
+			if err := c.codec.Write(m, body); err != nil {
+				return errors.InternalServerError("go.micro.client.codec", err.Error())
+			}
+			// set body
+			m.Body = c.buf.wbuf.Bytes()
 		}
-	}
-
-	if len(m.Body) == 0 {
-		// write to codec
-		if err := c.codec.Write(m, body); err != nil {
-			return errors.InternalServerError("go.micro.client.codec", err.Error())
-		}
-		// set body
-		m.Body = c.buf.wbuf.Bytes()
 	}
 
 	// create new transport message
@@ -208,10 +202,12 @@ func (c *rpcCodec) Write(m *codec.Message, body interface{}) error {
 		Header: m.Header,
 		Body:   m.Body,
 	}
+
 	// send the request
 	if err := c.client.Send(&msg); err != nil {
 		return errors.InternalServerError("go.micro.client.transport", err.Error())
 	}
+
 	return nil
 }
 

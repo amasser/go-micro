@@ -10,11 +10,11 @@ import (
 	"net/http"
 	"os"
 	"path"
-	"strconv"
+	"regexp"
 	"strings"
 
-	"github.com/micro/go-micro/util/kubernetes/api"
-	"github.com/micro/go-micro/util/log"
+	"github.com/micro/go-micro/v2/logger"
+	"github.com/micro/go-micro/v2/util/kubernetes/api"
 )
 
 var (
@@ -24,6 +24,8 @@ var (
 	ErrReadNamespace = errors.New("Could not read namespace from service account secret")
 	// DefaultImage is default micro image
 	DefaultImage = "micro/go-micro"
+	// DefaultNamespace is the default k8s namespace
+	DefaultNamespace = "default"
 )
 
 // Client ...
@@ -34,39 +36,30 @@ type client struct {
 // Kubernetes client
 type Client interface {
 	// Create creates new API resource
-	Create(*Resource) error
-	// Get queries API resrouces
-	Get(*Resource, map[string]string) error
+	Create(*Resource, ...CreateOption) error
+	// Get queries API resources
+	Get(*Resource, ...GetOption) error
 	// Update patches existing API object
-	Update(*Resource) error
+	Update(*Resource, ...UpdateOption) error
 	// Delete deletes API resource
-	Delete(*Resource) error
+	Delete(*Resource, ...DeleteOption) error
 	// List lists API resources
-	List(*Resource) error
+	List(*Resource, ...ListOption) error
 	// Log gets log for a pod
 	Log(*Resource, ...LogOption) (io.ReadCloser, error)
-}
-
-func detectNamespace() (string, error) {
-	nsPath := path.Join(serviceAccountPath, "namespace")
-
-	// Make sure it's a file and we can read it
-	if s, e := os.Stat(nsPath); e != nil {
-		return "", e
-	} else if s.IsDir() {
-		return "", ErrReadNamespace
-	}
-
-	// Read the file, and cast to a string
-	if ns, e := ioutil.ReadFile(nsPath); e != nil {
-		return string(ns), e
-	} else {
-		return string(ns), nil
-	}
+	// Watch for events
+	Watch(*Resource, ...WatchOption) (Watcher, error)
 }
 
 // Create creates new API object
-func (c *client) Create(r *Resource) error {
+func (c *client) Create(r *Resource, opts ...CreateOption) error {
+	options := CreateOptions{
+		Namespace: c.opts.Namespace,
+	}
+	for _, o := range opts {
+		o(&options)
+	}
+
 	b := new(bytes.Buffer)
 	if err := renderTemplate(r.Kind, b, r.Value); err != nil {
 		return err
@@ -75,25 +68,46 @@ func (c *client) Create(r *Resource) error {
 	return api.NewRequest(c.opts).
 		Post().
 		SetHeader("Content-Type", "application/yaml").
+		Namespace(options.Namespace).
 		Resource(r.Kind).
 		Body(b).
 		Do().
 		Error()
 }
 
+var (
+	nameRegex = regexp.MustCompile("[^a-zA-Z0-9]+")
+)
+
+// SerializeResourceName removes all spacial chars from a string so it
+// can be used as a k8s resource name
+func SerializeResourceName(ns string) string {
+	return nameRegex.ReplaceAllString(ns, "-")
+}
+
 // Get queries API objects and stores the result in r
-func (c *client) Get(r *Resource, labels map[string]string) error {
+func (c *client) Get(r *Resource, opts ...GetOption) error {
+	options := GetOptions{
+		Namespace: c.opts.Namespace,
+	}
+	for _, o := range opts {
+		o(&options)
+	}
+
 	return api.NewRequest(c.opts).
 		Get().
 		Resource(r.Kind).
-		Params(&api.Params{LabelSelector: labels}).
+		Namespace(options.Namespace).
+		Params(&api.Params{LabelSelector: options.Labels}).
 		Do().
 		Into(r.Value)
 }
 
 // Log returns logs for a pod
 func (c *client) Log(r *Resource, opts ...LogOption) (io.ReadCloser, error) {
-	var options LogOptions
+	options := LogOptions{
+		Namespace: c.opts.Namespace,
+	}
 	for _, o := range opts {
 		o(&options)
 	}
@@ -102,7 +116,8 @@ func (c *client) Log(r *Resource, opts ...LogOption) (io.ReadCloser, error) {
 		Get().
 		Resource(r.Kind).
 		SubResource("log").
-		Name(r.Name)
+		Name(r.Name).
+		Namespace(options.Namespace)
 
 	if options.Params != nil {
 		req.Params(&api.Params{Additional: options.Params})
@@ -120,18 +135,28 @@ func (c *client) Log(r *Resource, opts ...LogOption) (io.ReadCloser, error) {
 }
 
 // Update updates API object
-func (c *client) Update(r *Resource) error {
+func (c *client) Update(r *Resource, opts ...UpdateOption) error {
+	options := UpdateOptions{
+		Namespace: c.opts.Namespace,
+	}
+	for _, o := range opts {
+		o(&options)
+	}
+
 	req := api.NewRequest(c.opts).
 		Patch().
 		SetHeader("Content-Type", "application/strategic-merge-patch+json").
 		Resource(r.Kind).
-		Name(r.Name)
+		Name(r.Name).
+		Namespace(options.Namespace)
 
 	switch r.Kind {
 	case "service":
 		req.Body(r.Value.(*Service))
 	case "deployment":
 		req.Body(r.Value.(*Deployment))
+	case "pod":
+		req.Body(r.Value.(*Pod))
 	default:
 		return errors.New("unsupported resource")
 	}
@@ -140,26 +165,71 @@ func (c *client) Update(r *Resource) error {
 }
 
 // Delete removes API object
-func (c *client) Delete(r *Resource) error {
+func (c *client) Delete(r *Resource, opts ...DeleteOption) error {
+	options := DeleteOptions{
+		Namespace: c.opts.Namespace,
+	}
+	for _, o := range opts {
+		o(&options)
+	}
+
 	return api.NewRequest(c.opts).
 		Delete().
 		Resource(r.Kind).
 		Name(r.Name).
+		Namespace(options.Namespace).
 		Do().
 		Error()
 }
 
 // List lists API objects and stores the result in r
-func (c *client) List(r *Resource) error {
-	labels := map[string]string{
-		"micro": "service",
+func (c *client) List(r *Resource, opts ...ListOption) error {
+	options := ListOptions{
+		Namespace: c.opts.Namespace,
 	}
-	return c.Get(r, labels)
+	for _, o := range opts {
+		o(&options)
+	}
+
+	return c.Get(r, GetNamespace(options.Namespace))
+}
+
+// Watch returns an event stream
+func (c *client) Watch(r *Resource, opts ...WatchOption) (Watcher, error) {
+	options := WatchOptions{
+		Namespace: c.opts.Namespace,
+	}
+	for _, o := range opts {
+		o(&options)
+	}
+
+	// set the watch param
+	params := &api.Params{Additional: map[string]string{
+		"watch": "true",
+	}}
+
+	// get options params
+	if options.Params != nil {
+		for k, v := range options.Params {
+			params.Additional[k] = v
+		}
+	}
+
+	req := api.NewRequest(c.opts).
+		Get().
+		Resource(r.Kind).
+		Name(r.Name).
+		Namespace(options.Namespace).
+		Params(params)
+
+	return newWatcher(req)
 }
 
 // NewService returns default micro kubernetes service definition
-func NewService(name, version, typ string) *Service {
-	log.Tracef("kubernetes default service: name: %s, version: %s", name, version)
+func NewService(name, version, typ, namespace string) *Service {
+	if logger.V(logger.TraceLevel, logger.DefaultLogger) {
+		logger.Tracef("kubernetes default service: name: %s, version: %s", name, version)
+	}
 
 	Labels := map[string]string{
 		"name":    name,
@@ -173,9 +243,13 @@ func NewService(name, version, typ string) *Service {
 		svcName = strings.Join([]string{name, version}, "-")
 	}
 
+	if len(namespace) == 0 {
+		namespace = DefaultNamespace
+	}
+
 	Metadata := &Metadata{
 		Name:      svcName,
-		Namespace: "default",
+		Namespace: SerializeResourceName(namespace),
 		Version:   version,
 		Labels:    Labels,
 	}
@@ -184,7 +258,7 @@ func NewService(name, version, typ string) *Service {
 		Type:     "ClusterIP",
 		Selector: Labels,
 		Ports: []ServicePort{{
-			"service-port", 9090, "",
+			"service-port", 8080, "",
 		}},
 	}
 
@@ -195,8 +269,10 @@ func NewService(name, version, typ string) *Service {
 }
 
 // NewService returns default micro kubernetes deployment definition
-func NewDeployment(name, version, typ string) *Deployment {
-	log.Tracef("kubernetes default deployment: name: %s, version: %s", name, version)
+func NewDeployment(name, version, typ, namespace string) *Deployment {
+	if logger.V(logger.TraceLevel, logger.DefaultLogger) {
+		logger.Tracef("kubernetes default deployment: name: %s, version: %s", name, version)
+	}
 
 	Labels := map[string]string{
 		"name":    name,
@@ -210,9 +286,13 @@ func NewDeployment(name, version, typ string) *Deployment {
 		depName = strings.Join([]string{name, version}, "-")
 	}
 
+	if len(namespace) == 0 {
+		namespace = DefaultNamespace
+	}
+
 	Metadata := &Metadata{
 		Name:        depName,
-		Namespace:   "default",
+		Namespace:   SerializeResourceName(namespace),
 		Version:     version,
 		Labels:      Labels,
 		Annotations: map[string]string{},
@@ -236,7 +316,7 @@ func NewDeployment(name, version, typ string) *Deployment {
 					Name:    name,
 					Image:   DefaultImage,
 					Env:     []EnvVar{env},
-					Command: []string{"go", "run", "main.go"},
+					Command: []string{},
 					Ports: []ContainerPort{{
 						Name:          "service-port",
 						ContainerPort: 8080,
@@ -252,52 +332,41 @@ func NewDeployment(name, version, typ string) *Deployment {
 	}
 }
 
-// NewLocalDevClient returns a client that can be used with `kubectl proxy` on an optional port
-func NewLocalDevClient(port ...int) *client {
-	var p int
-	if len(port) > 1 {
-		log.Fatal("Expected 0 or 1 port parameters")
-	}
-	if len(port) == 0 {
-		p = 8001
-	} else {
-		p = port[0]
+// NewLocalClient returns a client that can be used with `kubectl proxy`
+func NewLocalClient(hosts ...string) *client {
+	if len(hosts) == 0 {
+		hosts[0] = "http://localhost:8001"
 	}
 	return &client{
 		opts: &api.Options{
 			Client:    http.DefaultClient,
-			Host:      "http://localhost:" + strconv.Itoa(p),
+			Host:      hosts[0],
 			Namespace: "default",
 		},
 	}
 }
 
-// NewClientInCluster creates a Kubernetes client for use from within a k8s pod.
-func NewClientInCluster() *client {
+// NewClusterClient creates a Kubernetes client for use from within a k8s pod.
+func NewClusterClient() *client {
 	host := "https://" + os.Getenv("KUBERNETES_SERVICE_HOST") + ":" + os.Getenv("KUBERNETES_SERVICE_PORT")
 
 	s, err := os.Stat(serviceAccountPath)
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal(err)
 	}
 	if s == nil || !s.IsDir() {
-		log.Fatal(errors.New("service account not found"))
+		logger.Fatal(errors.New("service account not found"))
 	}
 
 	token, err := ioutil.ReadFile(path.Join(serviceAccountPath, "token"))
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal(err)
 	}
 	t := string(token)
 
-	ns, err := detectNamespace()
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	crt, err := CertPoolFromFile(path.Join(serviceAccountPath, "ca.crt"))
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal(err)
 	}
 
 	c := &http.Client{
@@ -313,8 +382,8 @@ func NewClientInCluster() *client {
 		opts: &api.Options{
 			Client:      c,
 			Host:        host,
-			Namespace:   ns,
 			BearerToken: &t,
+			Namespace:   DefaultNamespace,
 		},
 	}
 }

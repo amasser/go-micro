@@ -19,8 +19,10 @@ type Service interface {
 	Run() error
 }
 
+//Option for web
 type Option func(o *Options)
 
+//Web basic Defaults
 var (
 	// For serving
 	DefaultName    = "go-web"
@@ -29,7 +31,7 @@ var (
 	DefaultAddress = ":0"
 
 	// for registration
-	DefaultRegisterTTL      = time.Minute
+	DefaultRegisterTTL      = time.Second * 90
 	DefaultRegisterInterval = time.Second * 30
 
 	// static directory

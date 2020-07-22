@@ -1,8 +1,11 @@
 package client
 
 var templates = map[string]string{
-	"deployment": deploymentTmpl,
-	"service":    serviceTmpl,
+	"deployment":     deploymentTmpl,
+	"service":        serviceTmpl,
+	"namespace":      namespaceTmpl,
+	"secret":         secretTmpl,
+	"serviceaccount": serviceAccountTmpl,
 }
 
 var deploymentTmpl = `
@@ -46,7 +49,8 @@ spec:
         {{ $key }}: "{{ $value }}"
         {{- end }}
         {{- end }}
-    spec:
+    spec: 
+      serviceAccountName: {{ .Spec.Template.PodSpec.ServiceAccountName }}
       containers:
       {{- with .Spec.Template.PodSpec.Containers }}
       {{- range . }}
@@ -56,7 +60,24 @@ spec:
           {{- range . }}
           - name: "{{ .Name }}"
             value: "{{ .Value }}"
+          {{- if .ValueFrom }}
+          {{- with .ValueFrom }}
+            valueFrom: 
+              {{- if .SecretKeyRef }}
+              {{- with .SecretKeyRef }}
+              secretKeyRef:
+                key: {{ .Key }}
+                name: {{ .Name }}
+                optional: {{ .Optional }}
+              {{- end }}
+              {{- end }}
           {{- end }}
+          {{- end }}
+          {{- end }}
+          {{- end }}
+          args:
+          {{- range .Args }}
+          - {{.}}
           {{- end }}
           command:
           {{- range .Command }}
@@ -102,4 +123,57 @@ spec:
     protocol: {{ .Protocol }}
   {{- end }}
   {{- end }}
+`
+
+var namespaceTmpl = `
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: "{{ .Metadata.Name }}"
+  labels:
+    {{- with .Metadata.Labels }}
+    {{- range $key, $value := . }}
+    {{ $key }}: "{{ $value }}"
+    {{- end }}
+    {{- end }}
+`
+
+var secretTmpl = `
+apiVersion: v1
+kind: Secret
+type: "{{ .Type }}"
+metadata:
+  name: "{{ .Metadata.Name }}"
+  namespace: "{{ .Metadata.Namespace }}"
+  labels:
+    {{- with .Metadata.Labels }}
+    {{- range $key, $value := . }}
+    {{ $key }}: "{{ $value }}"
+    {{- end }}
+    {{- end }}
+data:
+  {{- with .Data }}
+  {{- range $key, $value := . }}
+  {{ $key }}: "{{ $value }}"
+  {{- end }}
+  {{- end }}
+`
+
+var serviceAccountTmpl = `
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: "{{ .Metadata.Name }}"
+  labels:
+    {{- with .Metadata.Labels }}
+    {{- range $key, $value := . }}
+    {{ $key }}: "{{ $value }}"
+    {{- end }}
+    {{- end }}
+imagePullSecrets:
+{{- with .ImagePullSecrets }}
+{{- range . }}
+- name: "{{ .Name }}"
+{{- end }}
+{{- end }}
 `

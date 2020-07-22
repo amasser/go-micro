@@ -2,23 +2,21 @@
 package kubernetes
 
 import (
+	"encoding/base64"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/micro/go-micro/runtime"
-	"github.com/micro/go-micro/util/kubernetes/client"
-	"github.com/micro/go-micro/util/log"
+	"github.com/micro/go-micro/v2/logger"
+	log "github.com/micro/go-micro/v2/logger"
+	"github.com/micro/go-micro/v2/runtime"
+	"github.com/micro/go-micro/v2/util/kubernetes/client"
 )
 
 // action to take on runtime service
 type action int
-
-const (
-	start action = iota
-	update
-	stop
-)
 
 type kubernetes struct {
 	sync.RWMutex
@@ -30,11 +28,62 @@ type kubernetes struct {
 	closed chan bool
 	// client is kubernetes client
 	client client.Client
+	// namespaces which exist
+	namespaces []client.Namespace
+}
+
+// namespaceExists returns a boolean indicating if a namespace exists
+func (k *kubernetes) namespaceExists(name string) (bool, error) {
+	// populate the cache
+	if k.namespaces == nil {
+		if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+			logger.Debugf("Populating namespace cache")
+		}
+
+		namespaceList := new(client.NamespaceList)
+		resource := &client.Resource{Kind: "namespace", Value: namespaceList}
+		if err := k.client.List(resource); err != nil {
+			return false, err
+		}
+
+		if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+			logger.Debugf("Popualted namespace cache successfully with %v items", len(namespaceList.Items))
+		}
+		k.namespaces = namespaceList.Items
+	}
+
+	// check if the namespace exists in the cache
+	for _, n := range k.namespaces {
+		if n.Metadata.Name == name {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// createNamespace creates a new k8s namespace
+func (k *kubernetes) createNamespace(namespace string) error {
+	ns := client.Namespace{Metadata: &client.Metadata{Name: namespace}}
+	err := k.client.Create(&client.Resource{Kind: "namespace", Value: ns})
+
+	// ignore err already exists
+	if err != nil && strings.Contains(err.Error(), "already exists") {
+		logger.Debugf("Ignoring ErrAlreadyExists for namespace %v: %v", namespace, err)
+		err = nil
+	}
+
+	// add to cache
+	if err == nil && k.namespaces != nil {
+		k.namespaces = append(k.namespaces, ns)
+	}
+
+	return err
 }
 
 // getService queries kubernetes for micro service
 // NOTE: this function is not thread-safe
-func (k *kubernetes) getService(labels map[string]string) ([]*runtime.Service, error) {
+func (k *kubernetes) getService(labels map[string]string, opts ...client.GetOption) ([]*service, error) {
 	// get the service status
 	serviceList := new(client.ServiceList)
 	r := &client.Resource{
@@ -42,8 +91,10 @@ func (k *kubernetes) getService(labels map[string]string) ([]*runtime.Service, e
 		Value: serviceList,
 	}
 
+	opts = append(opts, client.GetLabels(labels))
+
 	// get the service from k8s
-	if err := k.client.Get(r, labels); err != nil {
+	if err := k.client.Get(r, opts...); err != nil {
 		return nil, err
 	}
 
@@ -53,14 +104,22 @@ func (k *kubernetes) getService(labels map[string]string) ([]*runtime.Service, e
 		Kind:  "deployment",
 		Value: depList,
 	}
+	if err := k.client.Get(d, opts...); err != nil {
+		return nil, err
+	}
 
-	// get the deployment from k8s
-	if err := k.client.Get(d, labels); err != nil {
+	// get the pods from k8s
+	podList := new(client.PodList)
+	p := &client.Resource{
+		Kind:  "pod",
+		Value: podList,
+	}
+	if err := k.client.Get(p, opts...); err != nil {
 		return nil, err
 	}
 
 	// service map
-	svcMap := make(map[string]*runtime.Service)
+	svcMap := make(map[string]*service)
 
 	// collect info from kubernetes service
 	for _, kservice := range serviceList.Items {
@@ -69,17 +128,29 @@ func (k *kubernetes) getService(labels map[string]string) ([]*runtime.Service, e
 		// version of the service
 		version := kservice.Metadata.Labels["version"]
 
-		// save as service
-		svcMap[name+version] = &runtime.Service{
-			Name:     name,
-			Version:  version,
-			Metadata: make(map[string]string),
+		srv := &service{
+			Service: &runtime.Service{
+				Name:     name,
+				Version:  version,
+				Metadata: make(map[string]string),
+			},
+			kservice: &kservice,
 		}
+
+		// set the address
+		address := kservice.Spec.ClusterIP
+		port := kservice.Spec.Ports[0]
+		srv.Service.Metadata["address"] = fmt.Sprintf("%s:%d", address, port.Port)
+		// set the type of service
+		srv.Service.Metadata["type"] = kservice.Metadata.Labels["micro"]
 
 		// copy annotations metadata into service metadata
 		for k, v := range kservice.Metadata.Annotations {
-			svcMap[name+version].Metadata[k] = v
+			srv.Service.Metadata[k] = v
 		}
+
+		// save as service
+		svcMap[name+version] = srv
 	}
 
 	// collect additional info from kubernetes deployment
@@ -98,9 +169,9 @@ func (k *kubernetes) getService(labels map[string]string) ([]*runtime.Service, e
 
 			// set the service name, version and source
 			// based on existing annotations we stored
-			svc.Name = kdep.Metadata.Annotations["name"]
-			svc.Version = kdep.Metadata.Annotations["version"]
-			svc.Source = kdep.Metadata.Annotations["source"]
+			svc.Service.Name = kdep.Metadata.Annotations["name"]
+			svc.Service.Version = kdep.Metadata.Annotations["version"]
+			svc.Service.Source = kdep.Metadata.Annotations["source"]
 
 			// delete from metadata
 			delete(kdep.Metadata.Annotations, "name")
@@ -109,34 +180,67 @@ func (k *kubernetes) getService(labels map[string]string) ([]*runtime.Service, e
 
 			// copy all annotations metadata into service metadata
 			for k, v := range kdep.Metadata.Annotations {
-				svc.Metadata[k] = v
+				svc.Service.Metadata[k] = v
 			}
 
 			// parse out deployment status and inject into service metadata
 			if len(kdep.Status.Conditions) > 0 {
-				status := kdep.Status.Conditions[0].Type
-				// pick the last known condition type and mark the service status with it
-				log.Debugf("Runtime setting %s service deployment status: %v", name, status)
-				svc.Metadata["status"] = status
+				svc.Status(kdep.Status.Conditions[0].Type, nil)
+				svc.Metadata["started"] = kdep.Status.Conditions[0].LastUpdateTime
+			} else {
+				svc.Status("n/a", nil)
 			}
 
-			// parse out deployment build
-			if build, ok := kdep.Spec.Template.Metadata.Annotations["build"]; ok {
-				buildTime, err := time.Parse(time.RFC3339, build)
-				if err != nil {
-					log.Debugf("Runtime failed parsing build time for %s: %v", name, err)
+			// get the real status
+			for _, item := range podList.Items {
+				var status string
+
+				// check the name
+				if item.Metadata.Labels["name"] != name {
 					continue
 				}
-				svc.Metadata["build"] = fmt.Sprintf("%d", buildTime.Unix())
-				continue
+				// check the version
+				if item.Metadata.Labels["version"] != version {
+					continue
+				}
+
+				switch item.Status.Phase {
+				case "Failed":
+					status = item.Status.Reason
+				default:
+					status = item.Status.Phase
+				}
+
+				// skip if we can't get the container
+				if len(item.Status.Containers) == 0 {
+					continue
+				}
+
+				// now try get a deeper status
+				state := item.Status.Containers[0].State
+
+				// set start time
+				if state.Running != nil {
+					svc.Metadata["started"] = state.Running.Started
+				}
+
+				// set status from waiting
+				if v := state.Waiting; v != nil {
+					if len(v.Reason) > 0 {
+						status = v.Reason
+					}
+				}
+				// TODO: set from terminated
+				svc.Status(status, nil)
 			}
-			// if no build annotation is found, set it to current time
-			svc.Metadata["build"] = fmt.Sprintf("%d", time.Now().Unix())
+
+			// save deployment
+			svc.kdeploy = &kdep
 		}
 	}
 
 	// collect all the services and return
-	services := make([]*runtime.Service, 0, len(serviceList.Items))
+	services := make([]*service, 0, len(serviceList.Items))
 
 	for _, service := range svcMap {
 		services = append(services, service)
@@ -157,17 +261,19 @@ func (k *kubernetes) run(events <-chan runtime.Event) {
 			// - do we even need the ticker for k8s services?
 		case event := <-events:
 			// NOTE: we only handle Update events for now
-			log.Debugf("Runtime received notification event: %v", event)
+			if log.V(log.DebugLevel, log.DefaultLogger) {
+				log.Debugf("Runtime received notification event: %v", event)
+			}
 			switch event.Type {
 			case runtime.Update:
 				// only process if there's an actual service
 				// we do not update all the things individually
-				if len(event.Service) == 0 {
+				if event.Service == nil {
 					continue
 				}
 
 				// format the name
-				name := client.Format(event.Service)
+				name := client.Format(event.Service.Name)
 
 				// set the default labels
 				labels := map[string]string{
@@ -175,8 +281,8 @@ func (k *kubernetes) run(events <-chan runtime.Event) {
 					"name":  name,
 				}
 
-				if len(event.Version) > 0 {
-					labels["version"] = event.Version
+				if len(event.Service.Version) > 0 {
+					labels["version"] = event.Service.Version
 				}
 
 				// get the deployment status
@@ -186,10 +292,12 @@ func (k *kubernetes) run(events <-chan runtime.Event) {
 				err := k.client.Get(&client.Resource{
 					Kind:  "deployment",
 					Value: deployed,
-				}, labels)
+				}, client.GetLabels(labels))
 
 				if err != nil {
-					log.Debugf("Runtime update failed to get service %s: %v", event.Service, err)
+					if log.V(log.DebugLevel, log.DefaultLogger) {
+						log.Debugf("Runtime update failed to get service %s: %v", event.Service, err)
+					}
 					continue
 				}
 
@@ -203,29 +311,26 @@ func (k *kubernetes) run(events <-chan runtime.Event) {
 					// update build time annotation
 					if service.Spec.Template.Metadata.Annotations == nil {
 						service.Spec.Template.Metadata.Annotations = make(map[string]string)
-
-					}
-
-					// check the existing build timestamp
-					if build, ok := service.Spec.Template.Metadata.Annotations["build"]; ok {
-						buildTime, err := time.Parse(time.RFC3339, build)
-						if err == nil && !event.Timestamp.After(buildTime) {
-							continue
-						}
 					}
 
 					// update the build time
-					service.Spec.Template.Metadata.Annotations["build"] = event.Timestamp.Format(time.RFC3339)
+					service.Spec.Template.Metadata.Annotations["updated"] = fmt.Sprintf("%d", event.Timestamp.Unix())
 
-					log.Debugf("Runtime updating service: %s deployment: %s", event.Service, service.Metadata.Name)
+					if log.V(log.DebugLevel, log.DefaultLogger) {
+						log.Debugf("Runtime updating service: %s deployment: %s", event.Service, service.Metadata.Name)
+					}
 					if err := k.client.Update(deploymentResource(&service)); err != nil {
-						log.Debugf("Runtime failed to update service %s: %v", event.Service, err)
+						if log.V(log.DebugLevel, log.DefaultLogger) {
+							log.Debugf("Runtime failed to update service %s: %v", event.Service, err)
+						}
 						continue
 					}
 				}
 			}
 		case <-k.closed:
-			log.Debugf("Runtime stopped")
+			if log.V(log.DebugLevel, log.DefaultLogger) {
+				log.Debugf("Runtime stopped")
+			}
 			return
 		}
 	}
@@ -243,32 +348,127 @@ func (k *kubernetes) Init(opts ...runtime.Option) error {
 	return nil
 }
 
+func (k *kubernetes) Logs(s *runtime.Service, options ...runtime.LogsOption) (runtime.LogStream, error) {
+	klo := newLog(k.client, s.Name, options...)
+	stream, err := klo.Stream()
+	if err != nil {
+		return nil, err
+	}
+	// If requested, also read existing records and stream those too
+	if klo.options.Count > 0 {
+		go func() {
+			records, err := klo.Read()
+			if err != nil {
+				log.Errorf("Failed to get logs for service '%v' from k8s: %v", s.Name, err)
+				return
+			}
+			// @todo: this might actually not run before podLogStream starts
+			// and might cause out of order log retrieval at the receiving end.
+			// A better approach would probably to suppor this inside the `klog.Stream` method.
+			for _, record := range records {
+				stream.Chan() <- record
+			}
+		}()
+	}
+	return stream, nil
+}
+
+type kubeStream struct {
+	// the k8s log stream
+	stream chan runtime.LogRecord
+	// the stop chan
+	sync.Mutex
+	stop chan bool
+	err  error
+}
+
+func (k *kubeStream) Error() error {
+	return k.err
+}
+
+func (k *kubeStream) Chan() chan runtime.LogRecord {
+	return k.stream
+}
+
+func (k *kubeStream) Stop() error {
+	k.Lock()
+	defer k.Unlock()
+	select {
+	case <-k.stop:
+		return nil
+	default:
+		close(k.stop)
+	}
+	return nil
+}
+
 // Creates a service
 func (k *kubernetes) Create(s *runtime.Service, opts ...runtime.CreateOption) error {
 	k.Lock()
 	defer k.Unlock()
 
 	options := runtime.CreateOptions{
-		Type: k.options.Type,
+		Type:      k.options.Type,
+		Namespace: client.DefaultNamespace,
 	}
 	for _, o := range opts {
 		o(&options)
 	}
 
-	// quickly prevalidate the name and version
-	name := s.Name
-	if len(s.Version) > 0 {
-		name = name + "-" + s.Version
+	// default type if it doesn't exist
+	if len(options.Type) == 0 {
+		options.Type = k.options.Type
 	}
 
-	// format as we'll format in the deployment
-	name = client.Format(name)
+	// default the source if it doesn't exist
+	if len(s.Source) == 0 {
+		s.Source = k.options.Source
+	}
 
-	// create new kubernetes micro service
+	// ensure the namespace exists
+	namespace := client.SerializeResourceName(options.Namespace)
+	// only do this if the namespace is not default
+	if namespace != "default" {
+		if exist, err := k.namespaceExists(namespace); err == nil && !exist {
+			if err := k.createNamespace(namespace); err != nil {
+				if logger.V(logger.WarnLevel, logger.DefaultLogger) {
+					logger.Warnf("Error creating namespacr %v: %v", namespace, err)
+				}
+				return err
+			}
+		} else if err != nil {
+			if logger.V(logger.WarnLevel, logger.DefaultLogger) {
+				logger.Warnf("Error checking namespace %v exists: %v", namespace, err)
+			}
+			return err
+		}
+	}
+	// determine the image from the source and options
+	options.Image = k.getImage(s, options)
+
+	// create a secret for the credentials if some where provided
+	if len(options.Credentials) > 0 {
+		secret, err := k.createCredentials(s, options)
+		if err != nil {
+			if logger.V(logger.WarnLevel, logger.DefaultLogger) {
+				logger.Warnf("Error generating auth credentials for service: %v", err)
+			}
+			return err
+		}
+
+		if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+			logger.Debugf("Generated auth credentials for service %v", s.Name)
+		}
+
+		// pass the secret name to the client via the credentials option
+		options.Credentials = secret
+	}
+
+	// create new service
 	service := newService(s, options)
 
 	// start the service
-	return service.Start(k.client)
+	return service.Start(k.client, client.CreateNamespace(options.Namespace))
 }
 
 // Read returns all instances of given service
@@ -277,11 +477,12 @@ func (k *kubernetes) Read(opts ...runtime.ReadOption) ([]*runtime.Service, error
 	defer k.Unlock()
 
 	// set the default labels
-	labels := map[string]string{
-		"micro": k.options.Type,
+	labels := map[string]string{}
+
+	options := runtime.ReadOptions{
+		Namespace: client.DefaultNamespace,
 	}
 
-	var options runtime.ReadOptions
 	for _, o := range opts {
 		o(&options)
 	}
@@ -299,47 +500,94 @@ func (k *kubernetes) Read(opts ...runtime.ReadOption) ([]*runtime.Service, error
 		labels["micro"] = options.Type
 	}
 
-	return k.getService(labels)
-}
-
-// List the managed services
-func (k *kubernetes) List() ([]*runtime.Service, error) {
-	k.Lock()
-	defer k.Unlock()
-
-	labels := map[string]string{
-		"micro": k.options.Type,
+	srvs, err := k.getService(labels, client.GetNamespace(options.Namespace))
+	if err != nil {
+		return nil, err
 	}
 
-	log.Debugf("Runtime listing all micro services")
+	var services []*runtime.Service
+	for _, service := range srvs {
+		services = append(services, service.Service)
+	}
 
-	return k.getService(labels)
+	return services, nil
 }
 
 // Update the service in place
-func (k *kubernetes) Update(s *runtime.Service) error {
-	// create new kubernetes micro service
-	service := newService(s, runtime.CreateOptions{
-		Type: k.options.Type,
-	})
+func (k *kubernetes) Update(s *runtime.Service, opts ...runtime.UpdateOption) error {
+	options := runtime.UpdateOptions{
+		Namespace: client.DefaultNamespace,
+	}
 
-	// update build time annotation
-	service.kdeploy.Spec.Template.Metadata.Annotations["build"] = time.Now().Format(time.RFC3339)
+	for _, o := range opts {
+		o(&options)
+	}
 
-	return service.Update(k.client)
+	labels := map[string]string{}
+
+	if len(s.Name) > 0 {
+		labels["name"] = client.Format(s.Name)
+	}
+
+	if len(s.Version) > 0 {
+		labels["version"] = s.Version
+	}
+
+	// get the existing service
+	services, err := k.getService(labels)
+	if err != nil {
+		return err
+	}
+
+	// update the relevant services
+	for _, service := range services {
+		// nil check
+		if service.kdeploy.Metadata == nil || service.kdeploy.Metadata.Annotations == nil {
+			md := new(client.Metadata)
+			md.Annotations = make(map[string]string)
+			service.kdeploy.Metadata = md
+		}
+
+		// update metadata
+		for k, v := range s.Metadata {
+			service.kdeploy.Metadata.Annotations[k] = v
+		}
+
+		// update build time annotation
+		service.kdeploy.Spec.Template.Metadata.Annotations["updated"] = fmt.Sprintf("%d", time.Now().Unix())
+
+		// update the service
+		if err := service.Update(k.client, client.UpdateNamespace(options.Namespace)); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Delete removes a service
-func (k *kubernetes) Delete(s *runtime.Service) error {
+func (k *kubernetes) Delete(s *runtime.Service, opts ...runtime.DeleteOption) error {
+	options := runtime.DeleteOptions{
+		Namespace: client.DefaultNamespace,
+	}
+	for _, o := range opts {
+		o(&options)
+	}
+
 	k.Lock()
 	defer k.Unlock()
 
 	// create new kubernetes micro service
 	service := newService(s, runtime.CreateOptions{
-		Type: k.options.Type,
+		Type:      k.options.Type,
+		Namespace: options.Namespace,
 	})
 
-	return service.Stop(k.client)
+	// delete the service credentials
+	ns := client.DeleteNamespace(options.Namespace)
+	k.client.Delete(&client.Resource{Name: credentialsName(s), Kind: "secret"}, ns)
+
+	return service.Stop(k.client, ns)
 }
 
 // Start starts the runtime
@@ -357,12 +605,14 @@ func (k *kubernetes) Start() error {
 	k.closed = make(chan bool)
 
 	var events <-chan runtime.Event
-	if k.options.Notifier != nil {
+	if k.options.Scheduler != nil {
 		var err error
-		events, err = k.options.Notifier.Notify()
+		events, err = k.options.Scheduler.Notify()
 		if err != nil {
 			// TODO: should we bail here?
-			log.Debugf("Runtime failed to start update notifier")
+			if log.V(log.DebugLevel, log.DefaultLogger) {
+				log.Debugf("Runtime failed to start update notifier")
+			}
 		}
 	}
 
@@ -387,9 +637,9 @@ func (k *kubernetes) Stop() error {
 		close(k.closed)
 		// set not running
 		k.running = false
-		// stop the notifier too
-		if k.options.Notifier != nil {
-			return k.options.Notifier.Close()
+		// stop the scheduler
+		if k.options.Scheduler != nil {
+			return k.options.Scheduler.Close()
 		}
 	}
 
@@ -415,11 +665,57 @@ func NewRuntime(opts ...runtime.Option) runtime.Runtime {
 	}
 
 	// kubernetes client
-	client := client.NewClientInCluster()
+	client := client.NewClusterClient()
 
 	return &kubernetes{
 		options: options,
 		closed:  make(chan bool),
 		client:  client,
 	}
+}
+
+func (k *kubernetes) getImage(s *runtime.Service, options runtime.CreateOptions) string {
+	// use the image when its specified
+	if len(options.Image) > 0 {
+		return options.Image
+	}
+
+	if len(k.options.Image) > 0 {
+		return k.options.Image
+	}
+
+	return ""
+}
+func (k *kubernetes) createCredentials(service *runtime.Service, options runtime.CreateOptions) (string, error) {
+	// validate the creds
+	comps := strings.Split(options.Credentials, ":")
+	if len(comps) != 2 {
+		return "", errors.New("Invalid credentials, expected format 'user:pass'")
+	}
+
+	// construct the k8s secret object
+	secret := &client.Secret{
+		Type: "Opaque",
+		Data: map[string]string{
+			"id":     base64.StdEncoding.EncodeToString([]byte(comps[0])),
+			"secret": base64.StdEncoding.EncodeToString([]byte(comps[1])),
+		},
+		Metadata: &client.Metadata{
+			Name:      credentialsName(service),
+			Namespace: options.Namespace,
+		},
+	}
+
+	// create options specify the namespace
+	ns := client.CreateNamespace(options.Namespace)
+
+	// crete the secret in kubernetes
+	name := credentialsName(service)
+	err := k.client.Create(&client.Resource{Kind: "secret", Name: name, Value: secret}, ns)
+	return name, err
+}
+
+func credentialsName(service *runtime.Service) string {
+	name := fmt.Sprintf("%v-%v-credentials", service.Name, service.Version)
+	return client.SerializeResourceName(name)
 }

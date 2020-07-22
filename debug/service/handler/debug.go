@@ -5,16 +5,23 @@ import (
 	"context"
 	"time"
 
-	"github.com/micro/go-micro/debug/log"
-	proto "github.com/micro/go-micro/debug/service/proto"
-	"github.com/micro/go-micro/debug/stats"
-	"github.com/micro/go-micro/server"
+	"github.com/micro/go-micro/v2/client"
+	"github.com/micro/go-micro/v2/debug/log"
+	proto "github.com/micro/go-micro/v2/debug/service/proto"
+	"github.com/micro/go-micro/v2/debug/stats"
+	"github.com/micro/go-micro/v2/debug/trace"
+	"github.com/micro/go-micro/v2/server"
 )
 
-var (
-	// DefaultHandler is default debug handler
-	DefaultHandler = newDebug()
-)
+// NewHandler returns an instance of the Debug Handler
+func NewHandler(c client.Client) *Debug {
+	return &Debug{
+		log:   log.DefaultLog,
+		stats: stats.DefaultStats,
+		trace: trace.DefaultTracer,
+		cache: c.Options().Cache,
+	}
+}
 
 type Debug struct {
 	// must honour the debug handler
@@ -23,13 +30,10 @@ type Debug struct {
 	log log.Log
 	// the stats collector
 	stats stats.Stats
-}
-
-func newDebug() *Debug {
-	return &Debug{
-		log:   log.DefaultLog,
-		stats: stats.DefaultStats,
-	}
+	// the tracer
+	trace trace.Tracer
+	// the cache
+	cache *client.Cache
 }
 
 func (d *Debug) Health(ctx context.Context, req *proto.HealthRequest, rsp *proto.HealthResponse) error {
@@ -56,6 +60,35 @@ func (d *Debug) Stats(ctx context.Context, req *proto.StatsRequest, rsp *proto.S
 	rsp.Threads = stats[0].Threads
 	rsp.Requests = stats[0].Requests
 	rsp.Errors = stats[0].Errors
+
+	return nil
+}
+
+func (d *Debug) Trace(ctx context.Context, req *proto.TraceRequest, rsp *proto.TraceResponse) error {
+	traces, err := d.trace.Read(trace.ReadTrace(req.Id))
+	if err != nil {
+		return err
+	}
+
+	for _, t := range traces {
+		var typ proto.SpanType
+		switch t.Type {
+		case trace.SpanTypeRequestInbound:
+			typ = proto.SpanType_INBOUND
+		case trace.SpanTypeRequestOutbound:
+			typ = proto.SpanType_OUTBOUND
+		}
+		rsp.Spans = append(rsp.Spans, &proto.Span{
+			Trace:    t.Trace,
+			Id:       t.Id,
+			Parent:   t.Parent,
+			Name:     t.Name,
+			Started:  uint64(t.Started.UnixNano()),
+			Duration: uint64(t.Duration.Nanoseconds()),
+			Type:     typ,
+			Metadata: t.Metadata,
+		})
+	}
 
 	return nil
 }
@@ -133,5 +166,11 @@ func (d *Debug) Log(ctx context.Context, stream server.Stream) error {
 		}
 	}
 
+	return nil
+}
+
+// Cache returns all the key value pairs in the client cache
+func (d *Debug) Cache(ctx context.Context, req *proto.CacheRequest, rsp *proto.CacheResponse) error {
+	rsp.Values = d.cache.List()
 	return nil
 }
